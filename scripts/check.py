@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Deterministic checks of LTA_DataMall_API_User_Guide.md against the PDF.
+"""Deterministic checks of LTA_DataMall_API_User_Guide.md and index.html against the PDF.
 
-The Markdown is rendered to HTML with markdown-it (CommonMark + GFM tables)
-and compared with what PyMuPDF reads from the PDF. The PDF side is extracted
-independently of scripts/convert.py, so a converter bug is not mirrored here.
+The Markdown is rendered to HTML with markdown-it (CommonMark + GFM tables);
+index.html is read as it is, minus the site header, contents and footer
+(elements marked data-chrome). Both are compared with what PyMuPDF reads from
+the PDF. The PDF side is extracted independently of scripts/convert.py, so a
+converter bug is not mirrored here.
 
 Checks:
   text       every PDF word appears in the Markdown, and nothing extra
@@ -21,6 +23,12 @@ Checks:
              point to a heading on the same target page
   code       JSON samples are fenced code blocks and parse as JSON
   syntax     no unrendered Markdown markers or raw tags leak into text
+
+index.html also gets:
+  tables     merged PDF cells have colspan/rowspan, and every table grid
+             is rectangular
+  html       tags are balanced, and the page has lang, charset, viewport
+             and title
 """
 
 from __future__ import annotations
@@ -93,19 +101,45 @@ class MdItem:
     words: list[str]
 
 
+def roman(n: int) -> str:
+    out = ""
+    for v, r in ((10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while n >= v:
+            out, n = out + r, n - v
+    return out
+
+
+def ol_label(n: int, kind: str) -> str:
+    if kind in "aA":
+        s = chr(ord("a") + n - 1)
+    elif kind in "iI":
+        s = roman(n)
+    else:
+        return str(n)
+    return s.upper() if kind.isupper() else s
+
+
+VOID = {"br", "img", "meta", "link", "hr", "input", "source", "wbr", "col"}
+
+
 class HtmlModel(HTMLParser):
     BLOCK = {"p", "li", "td", "th", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
-             "pre", "br", "ul", "ol", "table", "img", "blockquote"}
+             "pre", "br", "ul", "ol", "table", "img", "blockquote", "div",
+             "section", "figure", "main", "header", "footer", "nav", "details"}
+    SKIP = {"head", "script", "style", "template"}
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
+        self.skip = 0
+        self.heading_ids: set[str] = set()
+        self.spans: list[list[list[tuple[int, int]]]] = []  # parallel to tables
         self.s = Stream()
         self.stack: list[tuple[str, dict]] = []
         self.headings: list[tuple[int, str]] = []
         self.items: list[MdItem] = []
         self.item_stack: list[int] = []
         self.item_start: list[int] = []
-        self.ol_counters: list[int | None] = []
+        self.ol_counters: list[list | None] = []
         self.images: list[str] = []
         self.links: list[str] = []
         self.codeblocks: list[str] = []
@@ -133,6 +167,12 @@ class HtmlModel(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
+        if self.skip:
+            self.skip += tag not in VOID
+            return
+        if tag in self.SKIP or "data-chrome" in a:
+            self.skip = int(tag not in VOID)
+            return
         if tag in self.BLOCK:
             self.s.sep()
             if self.cell_buf is not None:
@@ -146,7 +186,7 @@ class HtmlModel(HTMLParser):
         if tag == "a":
             self.links.append(a.get("href", ""))
         elif tag in ("ul", "ol"):
-            self.ol_counters.append(int(a.get("start", 1)) if tag == "ol" else None)
+            self.ol_counters.append([int(a.get("start", 1)), a.get("type", "1")] if tag == "ol" else None)
         elif tag == "li":
             self.items.append(MdItem(len(self.ol_counters), []))
             self.item_stack.append(len(self.items) - 1)
@@ -154,21 +194,29 @@ class HtmlModel(HTMLParser):
             n = self.ol_counters[-1] if self.ol_counters else None
             if n is not None:
                 # The number is rendered by the list, so it has no formatting.
-                self.s.add(f"{n}. ", frozenset({"marker"}))
-                self.ol_counters[-1] = n + 1
+                self.s.add(f"{ol_label(*n)}. ", frozenset({"marker"}))
+                n[0] += 1
         elif tag == "table":
             self.tables.append([])
+            self.spans.append([])
         elif tag == "tr":
             self.tables[-1].append([])
+            self.spans[-1].append([])
         elif tag in ("td", "th"):
             self.cell_buf = []
+            self.spans[-1][-1].append((int(a.get("colspan", 1)), int(a.get("rowspan", 1))))
         elif re.fullmatch(r"h[1-6]", tag):
             self.heading_buf = []
+            if a.get("id"):
+                self.heading_ids.add(a["id"])
         elif tag == "pre":
             self.code_buf = []
 
     def handle_endtag(self, tag):
-        if tag in ("br", "img"):
+        if self.skip:
+            self.skip -= tag not in VOID
+            return
+        if tag in VOID:
             return
         while self.stack:
             t, _ = self.stack.pop()
@@ -196,6 +244,8 @@ class HtmlModel(HTMLParser):
             self.code_buf = None
 
     def handle_data(self, data):
+        if self.skip:
+            return
         self.raw_text.append(data)
         if "pre" not in {t for t, _ in self.stack}:
             data = re.sub(r"\s+", " ", data)
@@ -215,6 +265,48 @@ def github_slug(text: str) -> str:
     s = text.strip().lower()
     s = re.sub(r"[^\w\- ]", "", s)
     return s.replace(" ", "-")
+
+
+class TagBalance(HTMLParser):
+    """Records end tags that do not close the innermost open element."""
+
+    def __init__(self):
+        super().__init__()
+        self.open: list[str] = []
+        self.errors: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag not in VOID:
+            self.open.append(tag)
+
+    def handle_endtag(self, tag):
+        if tag in VOID:
+            self.errors.append(f"</{tag}>")
+        elif self.open and self.open[-1] == tag:
+            self.open.pop()
+        else:
+            self.errors.append(f"</{tag}> inside <{self.open[-1] if self.open else ''}>")
+
+
+def grid_errors(spans: list[list[tuple[int, int]]]) -> list[str]:
+    """Rows of a table whose cells, with spans, do not fill the same width."""
+    taken: dict[tuple[int, int], bool] = {}
+    widths = []
+    for ri, row in enumerate(spans):
+        col = 0
+        for cs, rs in row:
+            while (ri, col) in taken:
+                col += 1
+            for dr in range(rs):
+                for dc in range(cs):
+                    taken[(ri + dr, col + dc)] = True
+            col += cs
+        widths.append(max([c + 1 for r, c in taken if r == ri], default=0))
+    nrows = len(spans)
+    bad = [f"row {ri + 1}: width {w}" for ri, w in enumerate(widths) if w != max(widths, default=0)]
+    if any(r >= nrows for r, _ in taken):
+        bad.append("rowspan past the last row")
+    return bad
 
 
 JSON_LINE = re.compile(r'^\s*"[^"]+"\s*:')
@@ -387,12 +479,20 @@ class PdfModel:
         for page in self.doc:
             for t in page.find_tables(strategy="lines_strict").tables:
                 rows = []
+                spans = []
+                xs = sorted({round(c[0], 1) for c in t.cells} | {round(c[2], 1) for c in t.cells})
+                ys = sorted({round(c[1], 1) for c in t.cells} | {round(c[3], 1) for c in t.cells})
                 for r in t.rows:
                     cells = []
+                    row_spans = []
                     for c in r.cells:
                         if not c:
                             continue
                         rect = pymupdf.Rect(c)
+                        row_spans.append((
+                            sum(1 for x in xs if rect.x0 + 1 < x < rect.x1 - 1) + 1,
+                            sum(1 for y in ys if rect.y0 + 1 < y < rect.y1 - 1) + 1,
+                        ))
                         page_lines = sorted(
                             (l for l in self.lines if l.page == page.number + 1),
                             key=lambda l: (round(l.bbox.y0 / 3), l.bbox.x0),
@@ -410,7 +510,8 @@ class PdfModel:
                                 parts.append("".join(texts))
                         cells.append(words(" ".join(parts)))
                     rows.append(cells)
-                out.append((page.number + 1, pymupdf.Rect(t.bbox), rows))
+                    spans.append(row_spans)
+                out.append((page.number + 1, pymupdf.Rect(t.bbox), rows, spans))
         return out
 
 
@@ -437,14 +538,18 @@ def fmt(c: Counter, n: int = 8) -> str:
     return ", ".join(f"{w}×{k}" for w, k in c.most_common(n))
 
 
-def run(pdf_path: str, md_path: str) -> int:
+def run(p: PdfModel, path: str) -> int:
     rep = Report()
-    md = Path(md_path).read_text(encoding="utf-8")
-    base = Path(md_path).parent
-    html = render(md)
+    is_html = path.endswith((".html", ".htm"))
+    kind = "HTML" if is_html else "Markdown"
+    print(f"== {path}")
+    md = Path(path).read_text(encoding="utf-8")
+    base = Path(path).parent
+    html = md if is_html else render(md)
     m = HtmlModel()
     m.feed(html)
-    p = PdfModel(pdf_path)
+    m.close()
+    anchors = m.heading_ids if is_html else m.anchors
 
     md_tokens = m.s.tokens()
     pdf_tokens = p.stream().tokens()
@@ -454,9 +559,9 @@ def run(pdf_path: str, md_path: str) -> int:
     # text: same multiset of words
     missing = Counter(pdf_words) - Counter(md_words)
     extra = Counter(md_words) - Counter(pdf_words)
-    rep.check("text: every PDF word is in the Markdown", not missing,
+    rep.check(f"text: every PDF word is in the {kind}", not missing,
               f"{sum(missing.values())} missing: {fmt(missing)}")
-    rep.check("text: no words that are not in the PDF (no duplicates)", not extra,
+    rep.check(f"text: no words that are not in the PDF (no duplicates)", not extra,
               f"{sum(extra.values())} extra: {fmt(extra)}")
 
     # lines: each PDF line appears contiguously; pages appear in order
@@ -479,16 +584,16 @@ def run(pdf_path: str, md_path: str) -> int:
             broken.append(f"p{l.page}: {l.text.strip()[:60]!r}")
         else:
             page_pos.setdefault(l.page, []).append(pos)
-    rep.check("lines: every PDF line (3+ words) is contiguous in the Markdown",
+    rep.check(f"lines: every PDF line (3+ words) is contiguous in the {kind}",
               not broken, f"{len(broken)} broken: {broken[:5]}")
     medians = [(pg, sorted(v)[len(v) // 2]) for pg, v in sorted(page_pos.items())]
     order_bad = [f"p{a[0]}>p{b[0]}" for a, b in zip(medians, medians[1:]) if a[1] > b[1]]
-    rep.check("lines: pages appear in order", not order_bad, ", ".join(order_bad[:5]))
+    rep.check(f"lines: pages appear in order", not order_bad, ", ".join(order_bad[:5]))
 
     # headings
     expected = [(lvl + 1, re.sub(r"\s+", " ", t).strip()) for lvl, t, _ in p.toc]
     got = [h for h in m.headings if h[0] > 1]
-    rep.check("headings: every bookmark is a heading of the right level, in order",
+    rep.check(f"headings: every bookmark is a heading of the right level, in order",
               got == expected,
               f"expected {len(expected)}, got {len(got)}; first difference: "
               + next((f"{e} vs {g}" for e, g in zip(expected, got) if e != g), "length"))
@@ -501,7 +606,7 @@ def run(pdf_path: str, md_path: str) -> int:
         lost = pdf_f - md_f
         lost_outside_code = lost - md_markers
         added = md_f - pdf_f
-        rep.check(f"{flag}: PDF {flag} text is {flag} in the Markdown",
+        rep.check(f"{flag}: PDF {flag} text is {flag} in the {kind}",
                   not lost_outside_code,
                   f"{sum(pdf_f.values())} {flag} words; lost: {fmt(lost_outside_code)}")
         rep.check(f"{flag}: no {flag} text that is not {flag} in the PDF", not added,
@@ -511,7 +616,7 @@ def run(pdf_path: str, md_path: str) -> int:
         return Counter(x.strip() for x in text.split("\0") if x.strip())
 
     pdf_sup, md_sup = sup_runs(p.stream()), sup_runs(m.s)
-    rep.check("sup: superscript runs match the PDF", pdf_sup == md_sup,
+    rep.check(f"sup: superscript runs match the PDF", pdf_sup == md_sup,
               f"{sum(pdf_sup.values())} runs; missing {fmt(pdf_sup - md_sup)}; extra {fmt(md_sup - pdf_sup)}")
     # emphasis must also cover the same runs, not just the same words
     runs_bad = []
@@ -535,7 +640,7 @@ def run(pdf_path: str, md_path: str) -> int:
                 if len(cur) >= 2 and not contains_seq(md_flagged[flag], cur) and not contains_seq(code_words, cur):
                     runs_bad.append(f"{flag} p{line.page}: {' '.join(cur)[:50]!r}")
                 cur = []
-    rep.check("bold/italic: multi-word runs stay one run", not runs_bad,
+    rep.check(f"bold/italic: multi-word runs stay one run", not runs_bad,
               f"{len(runs_bad)}: {runs_bad[:5]}")
 
     # lists
@@ -554,7 +659,7 @@ def run(pdf_path: str, md_path: str) -> int:
         else:
             j = k + 1
         matched.append(k)
-    rep.check("lists: every PDF bullet/numbered line is a list item",
+    rep.check(f"lists: every PDF bullet/numbered line is a list item",
               not unmatched, f"{len(items)} items; {len(unmatched)} not lists: {unmatched[:5]}")
     nest_bad = []
     for (a, ka), (b, kb) in zip(zip(items, matched), list(zip(items, matched))[1:]):
@@ -567,7 +672,7 @@ def run(pdf_path: str, md_path: str) -> int:
         have = (db > da) - (db < da)
         if want != have:
             nest_bad.append(f"p{b.page}: {' '.join(b.words[:5])}")
-    rep.check("lists: nesting follows marker indentation", not nest_bad,
+    rep.check(f"lists: nesting follows marker indentation", not nest_bad,
               f"{len(nest_bad)}: {nest_bad[:5]}")
 
     # tables
@@ -590,7 +695,7 @@ def run(pdf_path: str, md_path: str) -> int:
     matchers = (lambda c, cw: c == cw, lambda c, cw: contains_seq(c, cw))
 
     def locate(cw: list[str], move: bool = True):
-        """First Markdown cell containing the words, searching from the last hit."""
+        """First output cell containing the words, searching from the last hit."""
         n = len(flat)
         order = list(range(cur[0], n)) + list(range(0, cur[0]))
         for match in matchers:
@@ -602,7 +707,7 @@ def run(pdf_path: str, md_path: str) -> int:
         return None
 
     def locate_in_row(cw: list[str], row: tuple[int, int], after: int):
-        """A cell right of column `after` in the given Markdown row."""
+        """A cell right of column `after` in the given output row."""
         for match in matchers:
             for k, (ti, ri, ci, c) in enumerate(flat):
                 if (ti, ri) == row and ci > after and match(c, cw):
@@ -611,13 +716,16 @@ def run(pdf_path: str, md_path: str) -> int:
         return None
 
     col_bad = []
-    for pno, bbox, rows in pdf_tables:
-        for r in rows:
+    span_bad = []
+    for pno, bbox, rows, spans in pdf_tables:
+        for r, rs in zip(rows, spans):
             nonempty = [c for c in r if c]
             if len(nonempty) == len(r) == 1 and len(rows) > 1:
                 continue  # full-width banner row, rendered as a paragraph
             locs = []
-            for c in nonempty:
+            for c, (cs, rsp) in zip(r, rs):
+                if not c:
+                    continue
                 ncells += 1
                 loc = None
                 if locs:
@@ -628,18 +736,28 @@ def run(pdf_path: str, md_path: str) -> int:
                         cell_bad.append(f"p{pno}: {' '.join(c)[:50]}")
                 else:
                     locs.append(loc)
+                    if is_html and (cs, rsp) != (1, 1):
+                        hcs, hrs = m.spans[loc[0]][loc[1]][loc[2]]
+                        if (cs > 1 and hcs < 2) or (rsp > 1 and hrs < 2 and spans_content(rows, r, rsp)):
+                            span_bad.append(f"p{pno}: {' '.join(c)[:40]} ({cs}x{rsp} in PDF, {hcs}x{hrs})")
             if len({l[:2] for l in locs}) > 1:
                 row_bad.append(f"p{pno}: {' '.join(nonempty[0])[:40]}")
             elif any(b[2] <= a[2] for a, b in zip(locs, locs[1:])):
                 col_bad.append(f"p{pno}: {' '.join(nonempty[0])[:40]}")
-    rep.check("tables: every PDF table cell is a single Markdown cell", not cell_bad,
+    rep.check(f"tables: every PDF table cell is a single {kind} cell", not cell_bad,
               f"{ncells} cells; {len(cell_bad)} bad: {cell_bad[:4]}")
-    rep.check("tables: cells of a PDF row share a Markdown row", not row_bad,
+    rep.check(f"tables: cells of a PDF row share a {kind} row", not row_bad,
               f"{len(row_bad)} split: {row_bad[:4]}")
-    rep.check("tables: cells of a PDF row are separate Markdown cells, in order", not col_bad,
+    rep.check(f"tables: cells of a PDF row are separate {kind} cells, in order", not col_bad,
               f"{len(col_bad)} merged or reordered: {col_bad[:4]}")
+    if is_html:
+        rep.check(f"tables: merged PDF cells have colspan/rowspan", not span_bad,
+                  f"{len(span_bad)}: {span_bad[:4]}")
+        grid_bad = [f"table {i + 1} {e}" for i, t in enumerate(m.spans) for e in grid_errors(t)]
+        rep.check(f"tables: every table grid is rectangular", not grid_bad, str(grid_bad[:4]))
+
     cur[0] = 0
-    for (pa, ba, ra), (pb, bb, rb) in zip(pdf_tables, pdf_tables[1:]):
+    for (pa, ba, ra, _), (pb, bb, rb, _) in zip(pdf_tables, pdf_tables[1:]):
         if pb != pa + 1 or abs(ba.x0 - bb.x0) > 4 or abs(ba.x1 - bb.x1) > 4:
             continue
         # Only a table that ends a page and one that starts the next continue.
@@ -659,16 +777,16 @@ def run(pdf_path: str, md_path: str) -> int:
         )
         if la and lb and la[0] != lb[0] and not is_header and not (len(first_row) == 1):
             join_bad.append(f"p{pa}-p{pb}")
-    rep.check("tables: tables continuing on the next page are joined", not join_bad,
+    rep.check(f"tables: tables continuing on the next page are joined", not join_bad,
               ", ".join(join_bad))
 
     # images
     p.images.sort(key=lambda t: (t[0], round(t[2].y0), t[2].x0))
     srcs = m.images
     missing_files = [s for s in srcs if not (base / s).is_file()]
-    rep.check("images: every PDF content image is referenced", len(srcs) == len(p.images),
-              f"PDF {len(p.images)}, Markdown {len(srcs)}")
-    rep.check("images: referenced files exist", not missing_files, str(missing_files[:5]))
+    rep.check(f"images: every PDF content image is referenced", len(srcs) == len(p.images),
+              f"PDF {len(p.images)}, {kind} {len(srcs)}")
+    rep.check(f"images: referenced files exist", not missing_files, str(missing_files[:5]))
     dims_bad = []
     xref_src: dict[int, str] = {}
     for (pno, xref, r), src in zip(p.images, srcs):
@@ -684,28 +802,28 @@ def run(pdf_path: str, md_path: str) -> int:
             info = p.doc.extract_image(xref)
             if (pix.width, pix.height) != (info["width"], info["height"]):
                 dims_bad.append(f"{src}: {pix.width}x{pix.height} != {info['width']}x{info['height']}")
-    rep.check("images: files decode and match the PDF image size", not dims_bad, str(dims_bad[:5]))
+    rep.check(f"images: files decode and match the PDF image size", not dims_bad, str(dims_bad[:5]))
     img_dir = base / "images"
     on_disk = {f"images/{f.name}" for f in img_dir.iterdir()} if img_dir.is_dir() else set()
     orphans = on_disk - set(srcs)
-    rep.check("images: no unreferenced files in images/", not orphans, str(sorted(orphans)[:5]))
+    rep.check(f"images: no unreferenced files in images/", not orphans, str(sorted(orphans)[:5]))
 
     # links
     hrefs = set(m.links)
     lost_uris = sorted(u for u in p.uris if u not in hrefs)
-    rep.check("links: every PDF hyperlink is a Markdown link", not lost_uris, str(lost_uris[:5]))
-    bad_anchors = sorted(h for h in hrefs if h.startswith("#") and h[1:] not in m.anchors)
-    rep.check("links: internal links point to headings", not bad_anchors, str(bad_anchors[:5]))
+    rep.check(f"links: every PDF hyperlink is a {kind} link", not lost_uris, str(lost_uris[:5]))
+    bad_anchors = sorted(h for h in hrefs if h.startswith("#") and h[1:] not in anchors)
+    rep.check(f"links: internal links point to headings", not bad_anchors, str(bad_anchors[:5]))
     md_targets = Counter(p.heading_pages.get(h[1:]) for h in m.links if h.startswith("#"))
     lost_goto = Counter(p.goto_pages) - md_targets
-    rep.check("links: every PDF internal link is a link to a heading on its target page",
+    rep.check(f"links: every PDF internal link is a link to a heading on its target page",
               not lost_goto, f"{len(p.goto_pages)} links; missing targets: {fmt(lost_goto)}")
 
     # code
     json_lines = [l for l in p.lines if JSON_LINE.match(l.text)]
     code_text = "\n".join(m.codeblocks)
     lost_json = [l.text.strip() for l in json_lines if l.text.strip() not in code_text]
-    rep.check("code: JSON sample lines are inside code blocks", not lost_json,
+    rep.check(f"code: JSON sample lines are inside code blocks", not lost_json,
               f"{len(json_lines)} lines; {len(lost_json)} outside: {lost_json[:3]}")
     bad_json = []
     for block in m.codeblocks:
@@ -714,26 +832,51 @@ def run(pdf_path: str, md_path: str) -> int:
                 json.loads(block)
             except json.JSONDecodeError as e:
                 bad_json.append(f"{block.strip()[:40]!r}: {e.msg} line {e.lineno}")
-    rep.check("code: JSON code blocks parse", not bad_json, f"{len(bad_json)}: {bad_json[:3]}")
+    rep.check(f"code: JSON code blocks parse", not bad_json, f"{len(bad_json)}: {bad_json[:3]}")
 
     # syntax: Markdown that failed to render
     text = "".join(m.raw_text)
     leaks = sorted(set(re.findall(r"\*\*|__|\]\(|\\\||</?(?:br|strong|em|sup|ul|ol|li|a|img|code)\b", text)))
-    rep.check("syntax: no unrendered Markdown or HTML in the text", not leaks, str(leaks))
+    rep.check(f"syntax: no unrendered {kind} or HTML in the text", not leaks, str(leaks))
     if "\n|" in md:
         bad_rows = [l for l in md.splitlines() if l.startswith("|") and not l.rstrip().endswith("|")]
-        rep.check("syntax: table rows are closed", not bad_rows, str(bad_rows[:2]))
+        rep.check(f"syntax: table rows are closed", not bad_rows, str(bad_rows[:2]))
 
-    print(f"\n{rep.failed} check(s) failed" if rep.failed else "\nAll checks passed")
+    if is_html:
+        tb = TagBalance()
+        tb.feed(html)
+        tb.close()
+        unclosed = [t for t in tb.open if t not in ("html", "body")]
+        rep.check(f"html: tags are balanced", not tb.errors and not unclosed,
+                  f"{tb.errors[:4]} unclosed: {unclosed[:4]}")
+        head = html.split("<body", 1)[0]
+        need = {
+            "lang": r"<html[^>]* lang=\"[a-z]",
+            "charset": r"<meta charset=\"utf-8\"",
+            "viewport": r"<meta name=\"viewport\" content=\"width=device-width",
+            "title": r"<title>[^<]+</title>",
+        }
+        lacking = [k for k, rx in need.items() if not re.search(rx, head, re.I)]
+        rep.check(f"html: page has lang, charset, viewport and title", not lacking, str(lacking))
+
+    print(f"\n{rep.failed} check(s) failed\n" if rep.failed else "\nAll checks passed\n")
     return 1 if rep.failed else 0
+
+
+def spans_content(rows: list, row: list, n: int) -> bool:
+    """Whether the n-1 PDF rows below `row` have text, so a rowspan is visible."""
+    i = next(k for k, r in enumerate(rows) if r is row)
+    return any(c for r in rows[i + 1 : i + n] for c in r)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--pdf", required=True)
     ap.add_argument("--md", default="LTA_DataMall_API_User_Guide.md")
+    ap.add_argument("--html", default="index.html")
     args = ap.parse_args()
-    return run(args.pdf, args.md)
+    p = PdfModel(args.pdf)
+    return max(run(p, args.md), run(p, args.html))
 
 
 if __name__ == "__main__":
