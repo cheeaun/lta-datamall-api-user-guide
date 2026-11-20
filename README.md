@@ -36,9 +36,9 @@ and extracts the PDF separately from the converter, then compares:
 | headings | Every PDF bookmark is a heading at the right level, in order |
 | bold, italic, sup | Formatted PDF text is formatted the same way, and nothing else is |
 | lists | Every bullet or numbered line is a list item, nested as in the PDF |
-| tables | Every PDF cell is one Markdown cell, cells of a row share a row, split tables are joined |
+| tables | Every PDF cell is its own Markdown cell, in the same row and column order; split tables are joined |
 | images | Every content image is referenced, exists, decodes, and has the PDF image's size |
-| links | Every PDF hyperlink is a link; internal links point to headings |
+| links | Every PDF hyperlink is a link; every internal link points to a heading on the page it targets |
 | code | JSON samples are in code blocks and parse |
 | syntax | No stray Markdown markers or raw HTML in the rendered text |
 

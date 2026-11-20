@@ -14,9 +14,11 @@ Checks:
   sup        superscripts are <sup>
   lists      bullet and numbered items are <li>, with the same nesting
   tables     each PDF table cell is one Markdown cell, rows stay rows,
+             columns keep their order,
              and tables continuing on the next page are joined
   images     every content image is extracted, referenced and intact
-  links      every PDF hyperlink target is a Markdown link
+  links      every PDF hyperlink is a Markdown link, and internal links
+             point to a heading on the same target page
   code       JSON samples are fenced code blocks and parse as JSON
   syntax     no unrendered Markdown markers or raw tags leak into text
 """
@@ -256,6 +258,9 @@ class PdfModel:
         self.images: list[tuple[int, int, pymupdf.Rect]] = []
         self.uris: set[str] = set()
         self.goto_pages: list[int] = []
+        self.heading_pages: dict[str, int] = {
+            github_slug(" ".join(title.split())): page for _, title, page in self.doc.get_toc()
+        }
         self.cells: dict[int, list[pymupdf.Rect]] = {}
         for page in self.doc:
             self._page(page)
@@ -577,21 +582,35 @@ def run(pdf_path: str, md_path: str) -> int:
     cell_bad, row_bad, join_bad = [], [], []
     ncells = 0
 
-    flat = [(ti, ri, words(c)) for ti, t in enumerate(m.tables) for ri, r in enumerate(t) for c in r]
+    flat = [
+        (ti, ri, ci, words(c))
+        for ti, t in enumerate(m.tables) for ri, r in enumerate(t) for ci, c in enumerate(r)
+    ]
     cur = [0]
+    matchers = (lambda c, cw: c == cw, lambda c, cw: contains_seq(c, cw))
 
     def locate(cw: list[str], move: bool = True):
         """First Markdown cell containing the words, searching from the last hit."""
         n = len(flat)
         order = list(range(cur[0], n)) + list(range(0, cur[0]))
-        for match in (lambda c: c == cw, lambda c: contains_seq(c, cw)):
+        for match in matchers:
             for k in order:
-                if match(flat[k][2]):
+                if match(flat[k][3], cw):
                     if move:
                         cur[0] = k
-                    return flat[k][:2]
+                    return flat[k][:3]
         return None
 
+    def locate_in_row(cw: list[str], row: tuple[int, int], after: int):
+        """A cell right of column `after` in the given Markdown row."""
+        for match in matchers:
+            for k, (ti, ri, ci, c) in enumerate(flat):
+                if (ti, ri) == row and ci > after and match(c, cw):
+                    cur[0] = k
+                    return ti, ri, ci
+        return None
+
+    col_bad = []
     for pno, bbox, rows in pdf_tables:
         for r in rows:
             nonempty = [c for c in r if c]
@@ -600,18 +619,25 @@ def run(pdf_path: str, md_path: str) -> int:
             locs = []
             for c in nonempty:
                 ncells += 1
-                loc = locate(c)
+                loc = None
+                if locs:
+                    loc = locate_in_row(c, locs[-1][:2], locs[-1][2])
+                loc = loc or locate(c)
                 if loc is None:
                     if len(rows) > 1 or len(r) > 1:
                         cell_bad.append(f"p{pno}: {' '.join(c)[:50]}")
                 else:
                     locs.append(loc)
-            if len(set(locs)) > 1:
+            if len({l[:2] for l in locs}) > 1:
                 row_bad.append(f"p{pno}: {' '.join(nonempty[0])[:40]}")
+            elif any(b[2] <= a[2] for a, b in zip(locs, locs[1:])):
+                col_bad.append(f"p{pno}: {' '.join(nonempty[0])[:40]}")
     rep.check("tables: every PDF table cell is a single Markdown cell", not cell_bad,
               f"{ncells} cells; {len(cell_bad)} bad: {cell_bad[:4]}")
     rep.check("tables: cells of a PDF row share a Markdown row", not row_bad,
               f"{len(row_bad)} split: {row_bad[:4]}")
+    rep.check("tables: cells of a PDF row are separate Markdown cells, in order", not col_bad,
+              f"{len(col_bad)} merged or reordered: {col_bad[:4]}")
     cur[0] = 0
     for (pa, ba, ra), (pb, bb, rb) in zip(pdf_tables, pdf_tables[1:]):
         if pb != pa + 1 or abs(ba.x0 - bb.x0) > 4 or abs(ba.x1 - bb.x1) > 4:
@@ -670,6 +696,10 @@ def run(pdf_path: str, md_path: str) -> int:
     rep.check("links: every PDF hyperlink is a Markdown link", not lost_uris, str(lost_uris[:5]))
     bad_anchors = sorted(h for h in hrefs if h.startswith("#") and h[1:] not in m.anchors)
     rep.check("links: internal links point to headings", not bad_anchors, str(bad_anchors[:5]))
+    md_targets = Counter(p.heading_pages.get(h[1:]) for h in m.links if h.startswith("#"))
+    lost_goto = Counter(p.goto_pages) - md_targets
+    rep.check("links: every PDF internal link is a link to a heading on its target page",
+              not lost_goto, f"{len(p.goto_pages)} links; missing targets: {fmt(lost_goto)}")
 
     # code
     json_lines = [l for l in p.lines if JSON_LINE.match(l.text)]
