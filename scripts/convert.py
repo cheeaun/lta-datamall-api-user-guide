@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the LTA DataMall API User Guide PDF and convert it to Markdown.
+"""Fetch the LTA DataMall API User Guide PDF and convert it to Markdown and HTML.
 
 The converter reads PDF primitives directly with PyMuPDF: text spans (for
 bold, italic, superscript and links), bordered table geometry (for merged
@@ -10,7 +10,9 @@ cells and tables that continue across pages), bullet glyphs and indentation
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
+import html
 import re
 import shutil
 import sys
@@ -26,6 +28,8 @@ PDF_URL = (
     "LTA_DataMall_API_User_Guide.pdf"
 )
 OUT_PATH = "LTA_DataMall_API_User_Guide.md"
+HTML_PATH = "index.html"
+REPO_URL = "https://github.com/cheeaun/lta-datamall-api-user-guide"
 IMAGE_DIR = "images"
 
 BULLET_GLYPHS = {"•", "▪", "◦", "○", "", "", "§", "-", "–", "o"}
@@ -120,6 +124,7 @@ class Cell:
     md: str
     plain: str
     all_bold: bool
+    html: str = ""
 
 
 @dataclass
@@ -742,12 +747,12 @@ class Converter:
             ]
             blocks = self.build_blocks(inside, pno, c.x1 - 3, cell=True)
             md, plain, bold = render_cell(blocks)
-            cells.append(Cell(r0, r1, c.x0, c.x1, md, plain, bold))
+            cells.append(Cell(r0, r1, c.x0, c.x1, md, plain, bold, render_cell_html(blocks)))
         return Table(cells, len(ys) - 1, bbox.x0, bbox.x1)
 
     # ---- document -------------------------------------------------------
 
-    def convert(self) -> str:
+    def blocks(self) -> list:
         pages = [self.convert_page(p) for p in self.doc]
         blocks: list = []
         for pblocks in pages:
@@ -763,12 +768,12 @@ class Converter:
                     a.items += b.items
                     pblocks = pblocks[1:]
             blocks.extend(pblocks)
-        title = re.sub(r"\s+", " ", self.doc.metadata.get("title") or "").strip()
-        out = []
-        for b in blocks:
-            out.append(render_block(b))
-        md = "\n\n".join(x for x in out if x.strip())
-        return md.strip() + "\n"
+        return blocks
+
+
+def render_markdown(blocks: list) -> str:
+    md = "\n\n".join(x for x in (render_block(b) for b in blocks) if x.strip())
+    return md.strip() + "\n"
 
 
 def split_by_cells(line: Line, cells: list[pymupdf.Rect]) -> list[Line]:
@@ -826,13 +831,17 @@ def nearest(points: list[float], v: float) -> int:
     return min(range(len(points)), key=lambda i: abs(points[i] - v))
 
 
+def shift(c: Cell, n: int) -> Cell:
+    return dataclasses.replace(c, r0=c.r0 + n, r1=c.r1 + n)
+
+
 def join_tables(a: Table, b: Table) -> Table:
     cells = list(a.cells)
     first_b = [c for c in b.cells if c.r0 == 0]
     first_a = sorted((c for c in a.cells if c.r0 == 0), key=lambda c: c.x0)
     # A repeated header row on the new page is dropped.
     if first_b and [c.plain for c in sorted(first_b, key=lambda c: c.x0)] == [c.plain for c in first_a] and all(c.all_bold for c in first_b if c.plain):
-        rest = [Cell(c.r0 - 1, c.r1 - 1, c.x0, c.x1, c.md, c.plain, c.all_bold) for c in b.cells if c.r0 > 0]
+        rest = [shift(c, -1) for c in b.cells if c.r0 > 0]
         nb = b.nrows - 1
     else:
         rest, nb = b.cells, b.nrows
@@ -846,16 +855,17 @@ def join_tables(a: Table, b: Table) -> Table:
                 continue
             target = min(last_a, key=lambda t: abs(t.x0 - c.x0) + abs(t.x1 - c.x1))
             target.md = f"{target.md}<br>{c.md}" if target.md else c.md
+            target.html = f"{target.html}<br>{c.html}" if target.html else c.html
             target.plain = f"{target.plain} {c.plain}".strip()
             target.all_bold = target.all_bold and c.all_bold
         for c in a.cells:
             if c.r1 == a.nrows:
                 c.r1 += max((x.r1 for x in first_rest), default=1) - 1
-        rest = [Cell(c.r0 - 1, c.r1 - 1, c.x0, c.x1, c.md, c.plain, c.all_bold) for c in rest if c.r0 > 0]
+        rest = [shift(c, -1) for c in rest if c.r0 > 0]
         nb -= 1
         # cells of the continued row that spanned further rows keep spanning
     for c in rest:
-        cells.append(Cell(c.r0 + a.nrows, c.r1 + a.nrows, c.x0, c.x1, c.md, c.plain, c.all_bold))
+        cells.append(shift(c, a.nrows))
     return Table(cells, a.nrows + nb, a.x0, a.x1)
 
 
@@ -1033,30 +1043,409 @@ def render_table(t: Table) -> str:
 
 
 # --------------------------------------------------------------------------
+# HTML rendering
+# --------------------------------------------------------------------------
+
+SITE_TITLE = "LTA DataMall API User Guide"
+VERSION_RE = re.compile(r"Version\s+([\d.]+)\s*\(([^)]+)\)")
+ROMAN = ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x",
+         "xi", "xii", "xiii", "xiv", "xv", "xvi", "xvii", "xviii", "xix", "xx"]
+_image_sizes: dict[str, tuple[int, int]] = {}
+
+CSS = """
+:root {
+  --fg: #1f2328; --muted: #59636e; --bg: #fff; --soft: #f6f8fa;
+  --line: #d1d9e0; --accent: #0b5cad; --head: #eaf1f8;
+  color-scheme: light dark;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  line-height: 1.55; color: var(--fg); background: var(--bg);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --fg: #e6edf3; --muted: #9198a1; --bg: #0d1117; --soft: #151b23;
+    --line: #3d444d; --accent: #4493f8; --head: #18212d;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+a { color: var(--accent); }
+.skip { position: absolute; left: -999rem; }
+.skip:focus { left: 1rem; top: 1rem; z-index: 1; padding: .5rem 1rem; background: var(--bg); }
+.site {
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: .25rem 1.5rem;
+  padding: 1rem clamp(1rem, 4vw, 2rem); border-bottom: 1px solid var(--line);
+}
+.site h1 { margin: 0; font-size: 1.25rem; }
+.site p { margin: 0; color: var(--muted); }
+.site nav { display: flex; gap: 1rem; margin-left: auto; }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr); max-width: 90rem; margin: 0 auto; }
+.toc { padding: .75rem clamp(1rem, 4vw, 1.5rem); font-size: .875rem; border-bottom: 1px solid var(--line); }
+.toc summary { cursor: pointer; font-weight: 600; }
+.toc ul { margin: 0; padding: 0; list-style: none; }
+.toc ul ul { padding-left: 1rem; }
+.toc a { display: block; padding: .2rem 0; color: var(--fg); text-decoration: none; }
+.toc a:hover { color: var(--accent); }
+.toc a[aria-current] { color: var(--accent); font-weight: 600; }
+@media (min-width: 64rem) {
+  .layout { grid-template-columns: 17rem minmax(0, 1fr); }
+  .toc {
+    position: sticky; top: 0; height: 100vh; overflow: auto;
+    border-bottom: 0; border-right: 1px solid var(--line);
+  }
+  .toc summary { display: none; }
+}
+main { min-width: 0; max-width: 62rem; padding: 1rem clamp(1rem, 4vw, 2.5rem) 4rem; }
+h2, h3, h4 { line-height: 1.25; scroll-margin-top: 1rem; }
+h2 { margin: 2.5rem 0 1rem; padding-bottom: .3rem; font-size: 1.6rem; border-bottom: 1px solid var(--line); }
+h3 { margin: 2rem 0 .75rem; font-size: 1.25rem; }
+img { max-width: 100%; height: auto; }
+img.inline { width: auto; height: 1.2em; vertical-align: -.2em; }
+figure { margin: 1.5rem 0; }
+figure img { border: 1px solid var(--line); border-radius: 4px; }
+.table-wrap { margin: 1rem 0; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+th, td {
+  padding: .45rem .6rem; text-align: left; vertical-align: top;
+  border: 1px solid var(--line); overflow-wrap: break-word;
+}
+.table-wrap table { border-style: hidden; }
+th[scope=col], th[scope=colgroup] { background: var(--head); }
+th[scope=row] { background: var(--soft); }
+td ul, td ol, th ul, th ol { margin: .25rem 0; padding-left: 1.25rem; }
+pre {
+  padding: .75rem 1rem; overflow: auto; font-size: .85rem; line-height: 1.45;
+  background: var(--soft); border: 1px solid var(--line); border-radius: 6px;
+}
+code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .9em; }
+.site-footer {
+  padding: 1.5rem clamp(1rem, 4vw, 2rem); color: var(--muted); font-size: .85rem;
+  border-top: 1px solid var(--line);
+}
+@media print {
+  .toc, .site nav, .skip { display: none; }
+  .layout { display: block; }
+  .table-wrap { overflow: visible; }
+}
+"""
+
+JS = """
+const toc = document.querySelector(".toc");
+const wide = matchMedia("(min-width: 64rem)");
+const sync = () => { toc.open = wide.matches; };
+sync();
+wide.addEventListener("change", sync);
+toc.addEventListener("click", (e) => {
+  if (e.target.closest("a") && !wide.matches) toc.open = false;
+});
+const links = new Map([...toc.querySelectorAll("a")].map((a) => [decodeURIComponent(a.hash.slice(1)), a]));
+const visible = new Set();
+const io = new IntersectionObserver((entries) => {
+  for (const e of entries) e.isIntersecting ? visible.add(e.target.id) : visible.delete(e.target.id);
+  const id = [...links.keys()].find((k) => visible.has(k));
+  if (!id) return;
+  for (const a of links.values()) a.removeAttribute("aria-current");
+  links.get(id).setAttribute("aria-current", "true");
+}, { rootMargin: "0px 0px -70% 0px" });
+for (const id of links.keys()) {
+  const el = document.getElementById(id);
+  if (el) io.observe(el);
+}
+"""
+
+
+def esc(s: str) -> str:
+    return html.escape(s, quote=False)
+
+
+def img_tag(src: str, alt: str, inline: bool = False) -> str:
+    w, h = _image_sizes.get(src, (0, 0))
+    size = f' width="{w}" height="{h}"' if w else ""
+    cls = ' class="inline"' if inline else ""
+    return f'<img src="{html.escape(src)}" alt="{html.escape(alt)}"{size}{cls} loading="lazy" decoding="async">'
+
+
+def linkify(s: str) -> str:
+    out, pos = [], 0
+    for m in URL_RE.finditer(s):
+        out.append(esc(s[pos : m.start()]))
+        out.append(f'<a href="{html.escape(m.group(0))}">{esc(m.group(0))}</a>')
+        pos = m.end()
+    out.append(esc(s[pos:]))
+    return "".join(out)
+
+
+def runs_html(runs: list[Run]) -> str:
+    parts: list[str] = []
+    for r in normalize_runs(runs):
+        if r.hard_break:
+            parts.append("<br>")
+            continue
+        if r.image:
+            parts.append(img_tag(r.image, "", inline=True))
+            continue
+        lead = r.text[: len(r.text) - len(r.text.lstrip())]
+        trail = r.text[len(r.text.rstrip()) :]
+        core = r.text.strip()
+        if not core:
+            parts.append(esc(r.text))
+            continue
+        inner = esc(core) if r.link else linkify(core)
+        if r.sup:
+            inner = f"<sup>{inner}</sup>"
+        else:
+            if r.italic:
+                inner = f"<em>{inner}</em>"
+            if r.bold:
+                inner = f"<strong>{inner}</strong>"
+        if r.link:
+            inner = f'<a href="{html.escape(r.link)}">{inner}</a>'
+        parts.append(esc(lead) + inner + esc(trail))
+    return "".join(parts)
+
+
+def ol_marker(kind: str, n: int) -> str:
+    if kind == "1":
+        return str(n)
+    if kind in "aA":
+        s = chr(ord("a") + n - 1) if 1 <= n <= 26 else ""
+    else:
+        s = ROMAN[n - 1] if 1 <= n <= len(ROMAN) else ""
+    return s.upper() if kind.isupper() else s
+
+
+def ol_kind(markers: list[str]) -> tuple[str, int] | None:
+    """The <ol type> and start that number items with exactly these markers."""
+    first = markers[0]
+    for kind in ("1", "a", "A", "i", "I"):
+        if kind == "1" and first.isdigit():
+            start = int(first)
+        elif kind in "aA" and len(first) == 1 and first.isalpha():
+            start = ord(first.lower()) - ord("a") + 1
+        elif kind in "iI" and first.lower() in ROMAN:
+            start = ROMAN.index(first.lower()) + 1
+        else:
+            continue
+        if all(m == ol_marker(kind, start + k) for k, m in enumerate(markers)):
+            return kind, start
+    return None
+
+
+def li_html(it: ListItem, literal: bool = False) -> str:
+    text = runs_html(it.runs)
+    if literal:
+        text = f"{esc(it.marker)} {text}"
+    if it.children:
+        text += list_html(it.children)
+    return f"<li>{text}</li>"
+
+
+def list_html(items: list[ListItem]) -> str:
+    parts = []
+    i = 0
+    while i < len(items):
+        j = i
+        while j < len(items) and items[j].ordered == items[i].ordered:
+            j += 1
+        if not items[i].ordered:
+            parts.append("<ul>" + "".join(li_html(it) for it in items[i:j]) + "</ul>")
+            i = j
+            continue
+        # the longest run from i that one <ol> numbers correctly
+        k = j
+        while k > i and ol_kind([it.marker[:-1] for it in items[i:k]]) is None:
+            k -= 1
+        if k == i:
+            parts.append("<ul>" + li_html(items[i], literal=True) + "</ul>")
+            i += 1
+            continue
+        kind, start = ol_kind([it.marker[:-1] for it in items[i:k]])
+        attrs = (f' type="{kind}"' if kind != "1" else "") + (f' start="{start}"' if start != 1 else "")
+        parts.append(f"<ol{attrs}>" + "".join(li_html(it) for it in items[i:k]) + "</ol>")
+        i = k
+    return "".join(parts)
+
+
+def render_cell_html(blocks) -> str:
+    parts = []
+    for b in blocks:
+        if isinstance(b, Para):
+            parts.append(runs_html(b.runs))
+        elif isinstance(b, ListBlock):
+            parts.append(list_html(b.items))
+        elif isinstance(b, Heading):
+            parts.append(f"<strong>{esc(b.text)}</strong>")
+        elif isinstance(b, Code):
+            parts.append("<br>".join(f"<code>{esc(x)}</code>" for x in b.lines))
+        elif isinstance(b, Image):
+            parts.append(img_tag(b.path, b.alt))
+    out = "<br>".join(p for p in parts if p)
+    out = re.sub(r"<br>(<[ou]l)", r"\1", out)
+    return re.sub(r"(</[ou]l>)<br>", r"\1", out)
+
+
+def table_html(t: Table) -> str:
+    xs = cluster([v for c in t.cells for v in (c.x0, c.x1)], TABLE_X_TOL)
+    ncols = len(xs) - 1
+    by_row: dict[int, list[Cell]] = {}
+    for c in t.cells:
+        by_row.setdefault(c.r0, []).append(c)
+    kept = sorted(r for r, cs in by_row.items() if any(c.plain or c.html for c in cs))
+    kept_set = set(kept)
+    head: list[str] = []
+    body: list[str] = []
+    for r in kept:
+        cells = sorted(by_row[r], key=lambda c: c.x0)
+        content = [c for c in cells if c.plain or c.html]
+        full = (len(cells) == 1 and ncols > 1 and nearest(xs, cells[0].x0) == 0
+                and nearest(xs, cells[0].x1) == ncols)
+        header = not full and len(content) >= 2 and all(c.all_bold for c in content)
+        out: list[list[str]] = []
+        for c in cells:
+            c0, c1 = nearest(xs, c.x0), nearest(xs, c.x1)
+            if c1 <= c0:  # narrower than the tolerance: part of its neighbour
+                if out and c.html:
+                    out[-1][1] += "<br>" + c.html
+                continue
+            if header:
+                tag, attrs = "th", ' scope="col"'
+            elif full and c.all_bold:
+                tag, attrs = "th", ' scope="colgroup"'
+            elif c0 == 0 and c.all_bold and len(content) >= 2:
+                tag, attrs = "th", ' scope="row"'
+            else:
+                tag, attrs = "td", ""
+            span = sum(1 for k in range(c.r0, c.r1) if k in kept_set)
+            if c1 - c0 > 1:
+                attrs += f' colspan="{c1 - c0}"'
+            if span > 1:
+                attrs += f' rowspan="{span}"'
+            out.append([f"<{tag}{attrs}>", c.html, f"</{tag}>"])
+        row = "<tr>" + "".join("".join(x) for x in out) + "</tr>"
+        (head if header and not body else body).append(row)
+    thead = "<thead>" + "".join(head) + "</thead>" if head else ""
+    return ('<div class="table-wrap" role="region" aria-label="Table" tabindex="0"><table>'
+            + thead + "<tbody>" + "".join(body) + "</tbody></table></div>")
+
+
+def block_html(b) -> str:
+    if isinstance(b, Para):
+        return f"<p>{runs_html(b.runs)}</p>"
+    if isinstance(b, Code):
+        lang = ' class="language-json"' if b.lines and b.lines[0].strip()[:1] in "{[" else ""
+        return f"<pre><code{lang}>" + esc("\n".join(b.lines)) + "</code></pre>"
+    if isinstance(b, Image):
+        return f"<figure>{img_tag(b.path, b.alt)}</figure>"
+    if isinstance(b, ListBlock):
+        return list_html(b.items)
+    if isinstance(b, Table):
+        return table_html(b)
+    raise TypeError(b)
+
+
+def toc_html(toc: list) -> str:
+    out, depth = [], 0
+    for level, title, _ in toc:
+        title = re.sub(r"\s+", " ", title).strip()
+        if level > depth:
+            out.append("<ul>" * (level - depth))
+        else:
+            out.append("</li>" + "</ul></li>" * (depth - level))
+        depth = level
+        out.append(f'<li><a href="#{slug(title)}">{esc(title)}</a>')
+    out.append("</li>" + "</ul></li>" * (depth - 1) + "</ul>" if depth else "")
+    return "".join(out)
+
+
+def render_html(blocks: list, doc: pymupdf.Document, base: Path, notice: str, md_name: str) -> str:
+    _image_sizes.clear()
+    for f in sorted((base / IMAGE_DIR).iterdir()):
+        pix = pymupdf.Pixmap(str(f))
+        _image_sizes[f"{IMAGE_DIR}/{f.name}"] = (pix.width, pix.height)
+
+    body: list[str] = []
+    open_levels: list[int] = []
+    for b in blocks:
+        if isinstance(b, Heading):
+            n = min(b.level + 1, 6)
+            while open_levels and open_levels[-1] >= n:
+                body.append("</section>")
+                open_levels.pop()
+            body.append("<section>")
+            open_levels.append(n)
+            body.append(f'<h{n} id="{slug(b.text)}">{esc(b.text)}</h{n}>')
+        else:
+            body.append(block_html(b))
+    body += ["</section>"] * len(open_levels)
+
+    m = VERSION_RE.search(doc[0].get_text())
+    version = f"<p>Version {esc(m.group(1))} · {esc(m.group(2))}</p>" if m else ""
+    desc = "The LTA DataMall API User Guide as a web page, generated from the official PDF."
+    return f"""<!doctype html>
+<!-- {notice} -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{SITE_TITLE}</title>
+<meta name="description" content="{desc}">
+<style>{CSS}</style>
+</head>
+<body>
+<a class="skip" href="#content" data-chrome>Skip to content</a>
+<header class="site" data-chrome>
+<h1>{SITE_TITLE}</h1>
+{version}
+<nav aria-label="Other formats"><a href="{PDF_URL}">PDF</a><a href="{md_name}">Markdown</a><a href="{REPO_URL}">GitHub</a></nav>
+</header>
+<div class="layout">
+<details class="toc" data-chrome open>
+<summary>Contents</summary>
+<nav aria-label="Contents">{toc_html(doc.get_toc())}</nav>
+</details>
+<main id="content">
+{chr(10).join(body)}
+</main>
+</div>
+<footer class="site-footer" data-chrome>
+<p>Generated from the <a href="{PDF_URL}">official PDF</a> by
+<a href="{REPO_URL}">cheeaun/lta-datamall-api-user-guide</a>.
+Content belongs to the Land Transport Authority of Singapore.</p>
+</footer>
+<script>{JS}</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
 
-def convert_pdf(pdf: bytes, out: Path) -> str:
+def convert_pdf(pdf: bytes, out: Path) -> tuple[str, str]:
+    """Return the Markdown and HTML for the PDF, writing images next to `out`."""
     doc = pymupdf.open(stream=pdf, filetype="pdf")
     image_dir = out.parent / IMAGE_DIR
     if image_dir.exists():
         shutil.rmtree(image_dir)
     image_dir.mkdir(parents=True)
-    md = Converter(doc, image_dir).convert()
+    blocks = Converter(doc, image_dir).blocks()
     sha = hashlib.sha256(pdf).hexdigest()
-    header = (
-        f"<!-- Generated by scripts/convert.py from {PDF_URL}\n"
-        f"     Source SHA-256: {sha}. Do not edit by hand. -->\n\n"
+    notice = (
+        f"Generated by scripts/convert.py from {PDF_URL}\n"
+        f"     Source SHA-256: {sha}. Do not edit by hand."
     )
-    return header + md
+    md = f"<!-- {notice} -->\n\n" + render_markdown(blocks)
+    page = render_html(blocks, doc, out.parent, notice, out.name)
+    return md, page
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--pdf", help="Use a local PDF instead of downloading")
     ap.add_argument("--pdf-out", help="Also save the downloaded PDF here")
-    ap.add_argument("--out", default=OUT_PATH)
+    ap.add_argument("--out", default=OUT_PATH, help="Markdown output path")
+    ap.add_argument("--html", default=HTML_PATH, help="HTML file name, written next to --out")
     args = ap.parse_args()
 
     if args.pdf:
@@ -1066,9 +1455,11 @@ def main() -> int:
         if args.pdf_out:
             Path(args.pdf_out).write_bytes(pdf)
     out = Path(args.out)
-    md = convert_pdf(pdf, out)
+    html_out = out.parent / Path(args.html).name
+    md, page = convert_pdf(pdf, out)
     out.write_text(md, encoding="utf-8")
-    print(f"Wrote {out} ({len(md):,} chars)", file=sys.stderr)
+    html_out.write_text(page, encoding="utf-8")
+    print(f"Wrote {out} ({len(md):,} chars) and {html_out} ({len(page):,} chars)", file=sys.stderr)
     return 0
 
 

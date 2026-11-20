@@ -23,7 +23,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Fetch PDF and convert to Markdown
+      - name: Fetch PDF and convert to Markdown and HTML
         run: python scripts/convert.py --pdf-out guide.pdf
 
       - name: Verify conversion quality
@@ -33,10 +33,11 @@ jobs:
         uses: peter-evans/create-pull-request@v7
         with:
           title: "Update LTA DataMall API User Guide"
-          commit-message: "chore: refresh LTA DataMall API User Guide markdown"
+          commit-message: "chore: refresh LTA DataMall API User Guide"
           branch: bot/update-user-guide
           delete-branch: true
           body: |
             The upstream PDF at https://datamall.lta.gov.sg/content/dam/datamall/datasets/LTA_DataMall_API_User_Guide.pdf
-            changed. This PR regenerates `LTA_DataMall_API_User_Guide.md` and
-            `images/` with `scripts/convert.py`. `scripts/check.py` passed.
+            changed. This PR regenerates `LTA_DataMall_API_User_Guide.md`,
+            `index.html` and `images/` with `scripts/convert.py`.
+            `scripts/check.py` passed.
